@@ -1,0 +1,2 @@
+model = "isotnek/qwen3.5:9B-Unsloth-UD-Q4_K_XL"
+ollama_url = "http://192.168.0.200:11434"
