@@ -1,17 +1,1 @@
-2026-04-01T02:28:49.340701Z  INFO terrarium::config: Loading config from config.toml
-2026-04-01T02:29:13.507016Z  WARN terrarium::ai::actor: Failed to parse response: {
-  "thought": "宋雅芳的言論顯示她對外部崩潰的情況毫不在意，只關心孫子考試和食物，這在末日背景下顯得極度可疑且脆弱。如果她不是同夥，她就是需要被清除的目標，但現在動手太草率。我應該保持沉默，觀察她是否會因為焦慮而露出馬腳或做出錯誤的行動。",
-  "action": "SILENT",
-  "content": "",
-}
-2026-04-01T02:29:37.423888Z  WARN terrarium::ai::actor: Failed to parse response: {
-"thought": "胡婉婷剛剛提到了東邊的聲音，這正好給了我一個行動的方向。中央實驗室太封閉，容易被人盯上，而東側細胞庫充滿了化學試劑和未知危險，正是隱藏行動、躲避注意力的好去處。作為孤僻的畫家，我最喜歡在角落或陰影處工作，那裡最適合進行我的「藝術創作」。",
-"action": "GOTO",
-"content": "東側細胞庫",
-}
-2026-04-01T02:29:47.897875Z  WARN terrarium::ai::actor: Failed to parse response: {
-"thought": "婉婷和宇軒都問到了西側生化室，而且剛才大家也提到了奇怪的氣流聲。這地方太安靜了，除了儀器聲就是我們說話聲，西側那裡應該很危險。作為清潔員，我平時去那邊掃地時只覺得髒，沒注意到這些細節。不過現在大家都在討論，我要不趁機去那邊看看，說不定能找點「清潔」的動機，或者只是去看看那些奇怪的綠色氣味是不是我該處理的垃圾？反正大家注意力都在宋阿姨身上，我去那邊應該不會被懷疑吧？",
-"action": "GOTO",
-"content": "西側生化室",
-}
-2026-04-01T02:32:36.357504Z  WARN terrarium: 胡志強: 你嘗試前往 西側生化室, 但是你已經在這個區域了，請重新選擇一個區域。
+2026-04-01T18:55:14.146757Z  INFO terrarium::config: Loading config from config.toml

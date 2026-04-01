@@ -3,10 +3,11 @@ use std::{cell::RefCell, collections::BTreeMap, fmt::Display};
 use anyhow::{Result, anyhow};
 use room::Room;
 
-use crate::ai::{actor::{Actor, ActorAgent}, director::Director};
+use crate::ai::{actor::Actor, director::Director};
 
 mod build;
 pub mod room;
+pub mod item;
 
 #[derive(Debug)]
 pub struct Scene {

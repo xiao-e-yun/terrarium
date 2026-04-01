@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow};
 use rig::completion::Prompt;
-use tokio::sync::broadcast;
 use tracing::{debug, error};
 
 use crate::{ai::director::Director, scene::room::Room};
@@ -38,49 +37,72 @@ pub async fn generate(director: &Director) -> Result<Scene> {
 }
 
 async fn generate_rooms(director: &Director, concept: &str) -> Result<BTreeMap<String, Room>> {
-    let prompt = format!("根據一場景描述，生成包含多個區域的地圖結構，並用一句話描述每個區域的特點和功能
+    let prompt = format!("根據場景描述，生成包含多個區域的地圖結構，並為每個區域設計相應的物品及特點描述。
 
-[嚴格限制]
-1. 輸出格式: 多行文本，每行描述一個區域，格式為\"區域名稱:一句話描述\"，其中區域名稱應簡潔明了。
-2. 零廢話: 直接給出結果，嚴禁輸出任何解釋、問候語或額外的文字。
-3. 字數限制: 每行描述的字數不超過 30 字，且整體描述應清晰易懂，能夠幫助玩家快速理解各區域的特點和用途。
-4. 內容要求: 描述應涵蓋區域的主要功能、氛圍，不得包含任何明確物品。
-5. 區域數量: 至少需要包含 8 個區域。
+### [嚴格限制]
+1. **輸出格式**: 必須輸出一個純淨且合法的壓縮後的 JSON 陣列 (Array)，陣列中的每個物件代表一個區域，並嚴格遵守指定的資料結構。
+2. **零廢話**: 直接給出 JSON 結果，**嚴禁**輸出任何解釋、問候語或 JSON 範圍外的額外文字。
+3. **字數限制**: 每個區域的 `description` 字數不超過 30 字，應清晰易懂，幫助玩家快速理解各區域的特點和用途。
+4. **物品要求**: 每個區域內的 `items` 清單必須合理分配物品。物品的 `tags` 標籤**必須且只能**從 `\"drink\"`、`\"food\"`、`\"weapon\"`` 這三種中選擇（可包含一個或多個標籤），物品的 `description` 描述必須說明包含什麼功能(可食用、可作為武器)。
+5. **物品數量**: 食物和飲料類物品的數量應該適中，既要提供足夠的資源讓玩家能夠生存下去，又要保持一定的挑戰性。武器類物品的數量應該有限，以增加遊戲的緊張感和策略性。
+6. **區域數量**: 輸出的 JSON 陣列中至少需要包含 8 個區域。
 
-[輸出範例]
-客廳: 一個寬敞的空間，擺放著破舊的沙發和一台老式電視
-廚房: 充滿了各種烹飪工具和食材的地方
-走廊: 連接各個房間的狹長通道，牆上掛滿了古老的畫作
-一號臥室: 一個昏暗的房間，裡面有一張破舊的床和一個衣櫃
-二號臥室: 一個明亮的房間，裡面有一張整潔的床和一個書桌
-...
+### [JSON 資料結構要求]
+每一個區域物件必須嚴格符合以下格式：
+```json
+{{
+  \"name\": \"字串 (簡潔明瞭的區域名稱)\",
+  \"items\": [
+    {{
+      \"name\": \"字串 (物品名稱)\",
+      \"description\": \"字串 (物品的簡短描述)\",
+      \"tags\": [\"drink\", \"food\", \"weapon\"] 
+    }}
+  ],
+  \"description\": \"字串 (一句話描述該區域的特點與功能)\"
+}}
+```
 
-[場景描述]
+### [輸出範例]
+```json
+[
+  {{
+    \"name\": \"廚房\",
+    \"items\": [
+      {{
+        \"name\": \"生鏽的菜刀\",
+        \"description\": \"刀刃已經嚴重生鏽，但依然可以用來防身。\",
+        \"tags\": [\"weapon\"]
+      }},
+      {{
+        \"name\": \"半瓶純水\",
+        \"description\": \"剩下半瓶的乾淨飲用水。\",
+        \"tags\": [\"drink\"]
+      }}
+    ],
+    \"description\": \"充滿了各種烹飪工具和殘留食材的料理空間\"
+  }},
+  {{
+    \"name\": \"客廳\",
+    \"items\": [
+      {{
+        \"name\": \"棒球棍\",
+        \"description\": \"靠在沙發角落的木製棒球棍。\",
+        \"tags\": [\"weapon\"]
+      }}
+    ],
+    \"description\": \"一個寬敞的空間，擺放著破舊的沙發和一台老式電視\"
+  }}
+]
+```
+
+### [場景描述]
 {}", concept);
-
-    fn parse_rooms(input: &str) -> Result<Vec<Room>> {
-        input
-            .lines()
-            .map(|line| {
-                let line = line.replace(':', "：");
-                let (name, description) = line
-                    .split_once('：')
-                    .ok_or(anyhow::anyhow!("Invalid room format: {}", line))?;
-                let broadcast = broadcast::Sender::new(128);
-                Ok(Room {
-                    name: name.trim().to_string(),
-                    description: description.trim().to_string(),
-                    actors: vec![],
-                    broadcast,
-                })
-            })
-            .try_collect()
-    }
 
     let mut err = None;
     for attempt in 1..=3 {
         let rooms = director.agent.prompt(&prompt).await?;
-        match parse_rooms(&rooms) {
+        match serde_json::from_str::<Vec<Room>>(&rooms) {
             Ok(list) => {
                 if list.len() >= 8 {
                     return Ok(list
@@ -93,7 +115,7 @@ async fn generate_rooms(director: &Director, concept: &str) -> Result<BTreeMap<S
             }
             Err(e) => {
                 error!("Attempt {}: Failed to parse rooms: {}", attempt, e);
-                err = Some(e);
+                err = Some(e.into());
             }
         }
     }

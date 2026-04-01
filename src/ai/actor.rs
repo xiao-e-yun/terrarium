@@ -1,11 +1,11 @@
 use std::{
     collections::HashMap,
     fmt::{Debug, Display},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU8},
 };
 
 use anyhow::{Result, bail};
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use rand::seq::{IndexedRandom, SliceRandom};
 use rig::{
     completion::{Chat, Prompt},
@@ -15,7 +15,11 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, broadcast};
 use tracing::{error, warn};
 
-use crate::{config::TAgent, role::Role};
+use crate::{
+    config::TAgent,
+    role::Role,
+    scene::item::{Item, ItemTag},
+};
 
 use super::{context::Context, director::Director};
 
@@ -27,7 +31,44 @@ pub struct Actor {
 
     personality: String,
 
-    shared: Arc<(DashSet<ActorStatus>, Mutex<ActorAgent>)>,
+    shared: Arc<ActorShared>,
+}
+
+struct ActorShared {
+    attributes: DashMap<ActorAttr, u32>,
+    status: DashSet<ActorStatus>,
+    inventory: DashSet<Item>,
+    agent: Mutex<ActorAgent>,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum ActorAttr {
+    Hunger,
+    Thirst,
+}
+
+impl ActorAttr {
+    pub fn display_attrs(&self, value: u32) -> String {
+        // 0~100
+        match value {
+            0..=5 => format!("你感到極度{}，快要撐不下去了.", self),
+            6..=15 => format!("你感到非常{}，已經很難受了.", self),
+            16..=25 => format!("你感到{}了，需要注意了.", self),
+            26..=30 => format!("你感到{}了.", self),
+            31..=80 => format!("你感到有點{}.", self),
+            81..=100 => format!("你還沒有感到{}.", self),
+            _ => format!("完全不{}，你感到非常健康.", self),
+        }
+    }
+}
+
+impl Display for ActorAttr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActorAttr::Hunger => write!(f, "飢餓"),
+            ActorAttr::Thirst => write!(f, "口渴"),
+        }
+    }
 }
 
 impl Actor {
@@ -43,12 +84,20 @@ impl Actor {
         &self.personality
     }
 
+    pub fn attrs(&self) -> &DashMap<ActorAttr, u32> {
+        &self.shared.as_ref().attributes
+    }
+
     pub fn status(&self) -> &DashSet<ActorStatus> {
-        &self.shared.as_ref().0
+        &self.shared.as_ref().status
+    }
+
+    pub fn inventory(&self) -> &DashSet<Item> {
+        &self.shared.as_ref().inventory
     }
 
     pub fn agent(&self) -> &Mutex<ActorAgent> {
-        &self.shared.as_ref().1
+        &self.shared.as_ref().agent
     }
 
     pub async fn generate_many(director: &Director, count: u8) -> Result<Vec<Self>> {
@@ -78,23 +127,49 @@ impl Actor {
 你的身分是\"{}\"，
 {}
 
-[人格設定]
+[性格設定]
 {}", &name, role, role.description(), personality));
             context.bind(&mut agent);
+
+            let inventory = DashSet::new();
+            if let Some(i) = match role {
+                Role::Murderer => Some(Item {
+                    name: "匕首".to_string(),
+                    description:
+                        "鋒利的鋼刃在暗處閃爍著寒光。它小巧且無聲，是近身索命最完美的工具。"
+                            .to_string(),
+                    tags: vec![ItemTag::Weapon],
+                }),
+                Role::Sheriff => Some(Item {
+                    name: "手槍".to_string(),
+                    description:
+                        "沈甸甸的警用左輪，槍管內隱約散發著火藥味。它是維護秩序與正義的最終防線。"
+                            .to_string(),
+                    tags: vec![ItemTag::Weapon],
+                }),
+                Role::Innocent => None,
+            } {
+                inventory.insert(i);
+            }
 
             actors.push(Actor {
                 role,
                 name,
                 personality,
-                shared: Arc::new((
-                    DashSet::new(),
-                    Mutex::new(ActorAgent {
+                shared: Arc::new(ActorShared {
+                    attributes: DashMap::from_iter([
+                        (ActorAttr::Hunger, 64),
+                        (ActorAttr::Thirst, 64),
+                    ]),
+                    status: DashSet::new(),
+                    inventory,
+                    agent: Mutex::new(ActorAgent {
                         context,
                         history: vec![],
                         broadcast: HashMap::new(),
                         agent,
                     }),
-                )),
+                }),
             });
         }
         Ok(actors)
@@ -104,15 +179,16 @@ impl Actor {
         let mut err = None;
         for attempt in 1..=3 {
             let personalities = agent
-                .prompt("請生成 5 組常見但偶有亮點的「一般性人格」設定。
+                .prompt("請生成 5 組常見但偶有亮點的性格設定。
 
 [嚴格限制]
 1. 字數限制: 每組設定的描述必須控制在 20 字以內，精煉且清晰易懂。
 2. 輸出格式: 只能輸出合法的 JSON 格式 `string[]`，絕對不准包含任何解釋、問候語或 Markdown 標記(如 ```json)。
 3. 合理性與風格: 大多數設定應具備平凡、生活感的普通特徵，但允許少數（約1至2組）帶有較為鮮明、有趣的個人怪癖或特色，以增添趣味。
+4. 剝離身分標籤: **描述中絕對不可包含任何職業、社會身分或年齡角色名詞**（如：社區委員、上班族、老人、學生、專家等），必須純粹聚焦於「性格特質」與「行為/說話習慣」。
 
 [輸出範例]
-[\"熱心但過度嘮叨的社區管理員\", \"總是害怕扛責的疲憊上班族\", \"溫和內向、熱愛閱讀的大學生\", \"極度強迫症，看見東西歪掉會崩潰\", \"熱衷於收集陌生人雨傘的神秘老人\"]")
+[\"熱心但說話容易失焦，常不自覺把話題扯遠\", \"性格溫和，習慣在每句話的句尾加上語氣詞\", \"做事按部就班，喜歡把手邊的物品按大小對齊\", \"隨性不拘小節，但對飲料的冰塊比例異常堅持\", \"沉穩少言，偶爾會用極具反差的冷幽默回應\"]")
                 .await?;
             match serde_json::from_str::<Vec<String>>(&personalities) {
                 Ok(list) => return Ok(list),
@@ -220,14 +296,14 @@ impl ActorAgent {
         Ok(())
     }
     pub async fn action(&mut self, prompt: &str) -> Result<ActorAction> {
-        let prompt = Message::system(format!(
+        let prompt = Message::user(format!(
             "請你嚴格遵守以下輸出格式規則，**絕對不要**輸出任何額外的解釋、問候語或在 JSON 範圍外的思考過程。必須確保輸出為純粹且合法的 JSON 格式。
 
 ### [輸出規則]
 嚴格按照以下 JSON 結構輸出，每次只能輸出單一個 JSON 物件，代表一個動作。該物件必須包含 `thought`、`action` 和 `content` 三個鍵值。任何不符合此 JSON 格式的輸出都將被視為無效。
 
 ### [JSON 欄位定義]
-* **`thought`**：字串。第一步的思考過程，如果沒有思考過程則填入空字串 `\"\"`。
+* **`thought`**：字串。描述你在做出該行為前的思考過程和理由，請確保這部分內容簡潔明了，直接反映你的內心想法和判斷。
 * **`action`**：字串。行為名稱，必須完全匹配。
 * **`content`**：字串。根據行為名稱的不同而有所區別，若無對應內容則填入空字串 `\"\"`。
 
@@ -235,7 +311,7 @@ impl ActorAgent {
             prompt
         ));
 
-        for _ in 1..=5 {
+        for _ in 1..=3 {
             let response = match self.agent.chat(prompt.clone(), self.history.clone()).await {
                 Ok(res) => res,
                 Err(e) => {
@@ -247,8 +323,8 @@ impl ActorAgent {
             match serde_json::from_str(&response) {
                 Ok(r) => {
                     self.history.push(Message::assistant(response.clone()));
-                    return Ok(r)
-                },
+                    return Ok(r);
+                }
                 Err(_) => warn!("Failed to parse response: {}", response),
             }
         }
