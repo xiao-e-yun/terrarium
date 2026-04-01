@@ -259,355 +259,412 @@ impl Game {
     }
 
     pub async fn action_actor(&mut self, actor: &Actor) -> Result<()> {
-        let mut scene = self.scene.lock().await;
-
-        /// (action name, action content, action description, action thinking)
-        type ActionPrompt = (&'static str, &'static str, &'static str, &'static str);
-        let mut prompt: Vec<ActionPrompt> = vec![
-            (
-                "SILENT",
-                "",
-                "你選擇保持沉默，不說話。",
-                "我想從他們的對話中取得更多信息。",
-            ),
-            (
-                "TALK",
-                "對話內容 (不需要加上引號)",
-                "你嘗試與其他玩家進行對話，分享你的想法或詢問他們的狀況。",
-                "我想通過對話來獲取更多信息，或者迷惑其他玩家讓他們暴露身份。",
-            ),
-            (
-                "GOTO",
-                "地點",
-                "你決定前往其他區域，尋找新的線索或避開危險。",
-                "我認為我在這裡待著不安全，或者這裡沒有什麼有用的信息了，我想去其他地方看看。",
-            ),
-            (
-                "OBSERVE",
-                "",
-                "你仔細觀察周圍的環境，尋找可能被忽略的線索。",
-                "我想看看周圍有沒有什麼我之前沒有注意到的細節，或者確認一下這裡的環境狀況。",
-            ),
-            (
-                "PICKUP",
-                "物品名稱",
-                "你嘗試撿起一個物品，可能是武器、食物或飲料。",
-                "我認為這個物品對我有用，可能可以幫助我生存或者完成我的目標。",
-            ),
-        ];
-
-        if !actor.inventory().is_empty() {
-            prompt.push((
-                "DROP",
-                "物品名稱",
-                "你選擇將身上的某個物品丟棄在原地，讓其他人可以拾取。",
-                "其他人目前比我更需要這個物品的幫助，所以我決定把它放下來提供給他們使用。",
-            ));
+        macro_rules! handle_invalid_action {
+            ($actor:expr, $($arg:tt)*) => {
+                warn!("{}: {}", $actor.name(), format!($($arg)*));
+                $actor
+                    .agent()
+                    .lock()
+                    .await
+                    .history
+                    .push(Message::user(format!("< {} >", format!($($arg)*))));
+            }
         }
 
-        if actor.inventory().iter().any(|item| {
-            item.tags
-                .iter()
-                .any(|t| t == &ItemTag::Drink || t == &ItemTag::Food)
-        }) {
-            prompt.push((
-                "USE",
-                "物品名稱 (食物或飲料)",
-                "你選擇消耗一個物品（如吃下食物或喝下飲料）來恢復自身的狀態。",
-                "我目前的狀態需要補充體力或水分，必須藉由進食或飲水來確保接下來能夠繼續行動。",
-            ));
-        }
+        // ── 對話 prompt (行動後共用) ─────────────────────────────────────────
+        let talk_prompt = "## [對話階段]
+現在是對話階段。請決定你是否要說話。
 
-        if actor
-            .inventory()
-            .iter()
-            .any(|item| item.tags.contains(&ItemTag::Weapon))
+- 若想說話，將 `talk` 填入你的對話內容；只能包含單句話，不得換行。
+- 若選擇沉默，將 `talk` 填入空字串 `\"\"`。
+
+```json
+{
+  \"thought\": \"你的思考過程\",
+  \"talk\": \"對話內容，或空字串\"
+}
+```
+";
+
+        // ── 行動 prompt ──────────────────────────────────────────────────────
         {
-            prompt.push((
-                "ATTACK",
-                "玩家名稱 (不包含對話)",
-                "你選擇殺死一名玩家，所有武器都是使用此行為。",
-                "我認為這名玩家對我構成了威脅，或者除掉他是我達成目標最快的方法。",
-            ));
-        }
+            type ActionPrompt = (&'static str, &'static str, &'static str, &'static str);
+            let mut prompt: Vec<ActionPrompt> = vec![
+                (
+                    "GOTO",
+                    "地點",
+                    "你決定前往其他區域，尋找新的線索或避開危險。",
+                    "我認為我在這裡待著不安全，或者這裡沒有什麼有用的信息了，我想去其他地方看看。",
+                ),
+                (
+                    "OBSERVE",
+                    "",
+                    "你仔細觀察周圍的環境，尋找可能被忽略的線索。",
+                    "我想看看周圍有沒有什麼我之前沒有注意到的細節，或者確認一下這裡的環境狀況。",
+                ),
+                (
+                    "PICKUP",
+                    "物品名稱",
+                    "你嘗試撿起一個物品，可能是武器、食物或飲料。",
+                    "我認為這個物品對我有用，可能可以幫助我生存或者完成我的目標。",
+                ),
+                (
+                    "IDLE",
+                    "",
+                    "你選擇不採取任何行動，靜觀其變。",
+                    "現在沒有特別需要做的事，我決定先觀望一下情況。",
+                ),
+            ];
 
-        let mut flatten_prompt = "## 以下是可用的行為列表\n".to_string();
-        for (i, (action, content, description, thinking)) in prompt.into_iter().enumerate() {
-            flatten_prompt += &format!(
-                "{}. {}:
+            if !actor.inventory().is_empty() {
+                prompt.push((
+                    "DROP",
+                    "物品名稱",
+                    "你選擇將身上的某個物品丟棄在原地，讓其他人可以拾取。",
+                    "其他人目前比我更需要這個物品的幫助，所以我決定把它放下來提供給他們使用。",
+                ));
+            }
+
+            if actor.inventory().iter().any(|item| {
+                item.tags
+                    .iter()
+                    .any(|t| t == &ItemTag::Drink || t == &ItemTag::Food)
+            }) {
+                prompt.push((
+                    "USE",
+                    "物品名稱 (食物或飲料)",
+                    "你選擇消耗一個物品（如吃下食物或喝下飲料）來恢復自身的狀態。",
+                    "我目前的狀態需要補充體力或水分，必須藉由進食或飲水來確保接下來能夠繼續行動。",
+                ));
+            }
+
+            if actor
+                .inventory()
+                .iter()
+                .any(|item| item.tags.contains(&ItemTag::Weapon))
+            {
+                prompt.push((
+                    "ATTACK",
+                    "玩家名稱 (不包含對話)",
+                    "你選擇殺死一名玩家，所有武器都是使用此行為。",
+                    "我認為這名玩家對我構成了威脅，或者除掉他是我達成目標最快的方法。",
+                ));
+            }
+
+            let mut flatten_prompt = "## 以下是可用的行為列表\n".to_string();
+            for (i, (action, content, description, thinking)) in prompt.into_iter().enumerate() {
+                flatten_prompt += &format!(
+                    "{}. {}:
 ```json
 {{
   \"thought\": \"{}\",
   \"action\": \"{}\",
-  \"content\": \"{}\"
+  \"content\": \"{}\",
+  \"talk\": \"執行此行動時想說的話，或空字串\"
 }}
 ```\n\n",
-                i + 1,
-                description,
-                thinking,
-                action,
-                content
-            );
+                    i + 1,
+                    description,
+                    thinking,
+                    action,
+                    content
+                );
+            }
+
+            // ── 執行行動 ─────────────────────────────────────────────────────
+            'do_action: for _attempt in 0..ACTION_RETRY_LIMIT {
+                let Ok(action) = async {
+                    let mut agent = actor.agent().lock().await;
+                    agent.action(&flatten_prompt).await
+                }
+                .await
+                else {
+                    continue;
+                };
+
+                macro_rules! broadcast {
+                    ($broadcast: expr, $($arg:tt)*) => {
+                        println!($($arg)*);
+                        $broadcast.broadcast.send(Message::user(format!($($arg)*))).unwrap();
+                    }
+                }
+
+                // 廣播 talk（行動同時說話）
+                if !action.talk.is_empty() {
+                    let scene = self.scene.lock().await;
+                    let room = scene.get_room_by_actor(actor).unwrap();
+                    println!("{}: {}", actor.name(), action.talk);
+                    room.broadcast
+                        .send(Message::user(format!("{}: {}", actor.name(), action.talk)))
+                        .unwrap();
+                }
+
+                let mut scene = self.scene.lock().await;
+
+                match action.action.as_str() {
+                    "IDLE" => {
+                        println!("< {} 靜觀其變 >", actor.name());
+                        return Ok(())
+                    }
+                    "GOTO" => {
+                        let from_room = scene.get_room_by_actor(actor).unwrap();
+                        let from = from_room.name.clone();
+                        let Some(to) = scene.match_room(&action.content).cloned() else {
+                            let all_room = scene
+                                .rooms
+                                .keys()
+                                .filter(|&r| r != &action.content)
+                                .cloned()
+                                .collect::<Vec<String>>()
+                                .join("\n");
+                            handle_invalid_action!(
+                                actor,
+                                "你嘗試前往 {}, 但是這個區域不存在，請重新選擇一個區域。\n{}",
+                                action.content,
+                                all_room
+                            );
+                            continue;
+                        };
+
+                        if from == to {
+                            let all_room = scene
+                                .rooms
+                                .keys()
+                                .filter(|&r| r != &to)
+                                .cloned()
+                                .collect::<Vec<String>>()
+                                .join("\n");
+                            handle_invalid_action!(
+                                actor,
+                                "你嘗試前往 {}, 但是你已經在這個區域了，請重新選擇一個區域。\n{}",
+                                action.content,
+                                all_room
+                            );
+                            continue;
+                        }
+
+                        broadcast!(from_room, "< {} 離開 {}，前往 {} >", actor.name(), from, to);
+                        scene.swap_actor_room(actor, &from, &to).await?;
+                        actor
+                            .agent()
+                            .lock()
+                            .await
+                            .history
+                            .push(Message::user(format!("< 你前往{} >", to)));
+                        break 'do_action;
+                    }
+                    "OBSERVE" => {
+                        let room = scene.get_room_by_actor(actor).unwrap();
+                        println!("< {} 仔細觀察周圍的環境 >", actor.name());
+                        actor
+                            .agent()
+                            .lock()
+                            .await
+                            .history
+                            .push(Message::user(format!(
+                                "< 你仔細觀察 {} 周圍的環境 >\n你發現了以下物品:\n{}",
+                                room.name,
+                                room.items
+                                    .iter()
+                                    .map(|item| format!("{}: {}", item.name, item.description))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            )));
+                        break 'do_action;
+                    }
+                    "PICKUP" => {
+                        let room = scene.get_room_by_actor_mut(actor).unwrap();
+                        let Some(item) = room
+                            .items
+                            .iter()
+                            .position(|item| item.name == action.content)
+                        else {
+                            handle_invalid_action!(
+                                actor,
+                                "你嘗試撿起 {}, 但是這個物品不存在，請重新選擇一個物品，或是使用 OBSERVE 來確認一下周圍的物品。",
+                                action.content
+                            );
+                            continue;
+                        };
+                        let item = room.items.swap_remove(item);
+
+                        broadcast!(room, "< {} 撿起了 {} >", actor.name(), item.name);
+                        actor.inventory().insert(item);
+                        break 'do_action;
+                    }
+                    "DROP" => {
+                        let item_opt = actor
+                            .inventory()
+                            .iter()
+                            .find(|item| item.name == action.content)
+                            .map(|ref_val| ref_val.clone());
+
+                        let Some(item) = item_opt else {
+                            handle_invalid_action!(
+                                actor,
+                                "你嘗試丟棄 {}, 但是你的背包裡沒有這個物品，請重新確認你身上的物品。",
+                                action.content
+                            );
+                            continue;
+                        };
+
+                        actor.inventory().remove(&item);
+
+                        let room = scene.get_room_by_actor_mut(actor).unwrap();
+                        broadcast!(room, "< {} 將 {} 丟棄在原地 >", actor.name(), item.name);
+                        room.items.push(item);
+                        break 'do_action;
+                    }
+                    "USE" => {
+                        let item_opt = actor
+                            .inventory()
+                            .iter()
+                            .find(|item| item.name == action.content)
+                            .map(|ref_val| ref_val.clone());
+
+                        let Some(item) = item_opt else {
+                            handle_invalid_action!(
+                                actor,
+                                "你嘗試使用 {}, 但是你的背包裡沒有這個物品，請重新確認你身上的物品。",
+                                action.content
+                            );
+                            continue;
+                        };
+
+                        if !item.tags.contains(&ItemTag::Food) && !item.tags.contains(&ItemTag::Drink) {
+                            handle_invalid_action!(
+                                actor,
+                                "你嘗試使用 {}, 但它不是食物或飲料，無法用來消耗與恢復狀態。",
+                                action.content
+                            );
+                            continue;
+                        }
+
+                        actor.inventory().remove(&item);
+
+                        let room = scene.get_room_by_actor(actor).unwrap();
+                        broadcast!(
+                            room,
+                            "< {} 使用了 {}，恢復了自身的狀態 >",
+                            actor.name(),
+                            item.name
+                        );
+
+                        let attrs = actor.attrs();
+                        for t in item.tags {
+                            match t {
+                                ItemTag::Food => *attrs.get_mut(&ActorAttr::Hunger).unwrap() += 128,
+                                ItemTag::Drink => *attrs.get_mut(&ActorAttr::Thirst).unwrap() += 128,
+                                ItemTag::Weapon => {}
+                            }
+                        }
+                        break 'do_action;
+                    }
+                    "ATTACK" => {
+                        let room = scene.get_room_by_actor_mut(actor).unwrap();
+                        let mut attacked = false;
+                        for target in room.actors.iter() {
+                            if !action.content.contains(target.name()) {
+                                continue;
+                            }
+
+                            if actor == target {
+                                handle_invalid_action!(
+                                    actor,
+                                    "你嘗試攻擊 {}, 但是你不能攻擊自己，請重新選擇一個行動。",
+                                    action.content
+                                );
+                                continue 'do_action;
+                            }
+
+                            if target.status().contains(&ActorStatus::Dead) {
+                                handle_invalid_action!(
+                                    actor,
+                                    "你嘗試攻擊 {}, 但是他已經死了，請重新選擇一個行動。",
+                                    action.content
+                                );
+                                continue 'do_action;
+                            }
+
+                            let weapon = actor
+                                .inventory()
+                                .iter()
+                                .find(|i| i.tags.contains(&ItemTag::Weapon));
+
+                            broadcast!(
+                                room,
+                                "< {} 使用 {} 殺死了 {} >",
+                                actor.name(),
+                                match &weapon {
+                                    Some(v) => v.name.to_string(),
+                                    None => "空手".to_string(),
+                                },
+                                target.name()
+                            );
+
+                            let status = target.status();
+                            status.insert(ActorStatus::Dead);
+
+                            let inventory = target.inventory();
+                            let items: Vec<_> =
+                                inventory.iter().map(|ref_val| ref_val.clone()).collect();
+                            inventory.clear();
+
+                            for item in items {
+                                broadcast!(room, "< {} 掉落了 {} >", target.name(), item.name);
+                                room.items.push(item);
+                            }
+
+                            attacked = true;
+                            break;
+                        }
+
+                        if attacked {
+                            break 'do_action;
+                        }
+
+                        handle_invalid_action!(
+                            actor,
+                            "你嘗試攻擊不在此區域的人 {}, 可能在其他區域。",
+                            action.content
+                        );
+                    }
+                    name => {
+                        handle_invalid_action!(actor, "行為 {} 不存在，請使用列表中的行為", name);
+                    }
+                };
+            }
         }
 
-        // do action
+        // ── 行動後 sync ──────────────────────────────────────────────────────
+        drop(self.scene.lock().await); // ensure no lock held
+        self.sync_actor(actor).await?;
+
+        // ── 執行對話 (後) ────────────────────────────────────────────────────
         for _attempt in 0..ACTION_RETRY_LIMIT {
-            let Ok(action) = async {
+            let Ok(result) = async {
                 let mut agent = actor.agent().lock().await;
-                agent.action(&flatten_prompt).await
+                agent.talk(talk_prompt).await
             }
             .await
             else {
                 continue;
             };
 
-            macro_rules! handle_invalid_action {
-                ($($arg:tt)*) => {
-                    warn!("{}: {}", actor.name(), format!($($arg)*));
-                    actor
-                        .agent()
-                        .lock()
-                        .await
-                        .history
-                        .push(Message::user(format!("< {} >",format!($($arg)*))));
-                }
+            if result.talk.is_empty() {
+                println!("< {} 選擇沉默 >", actor.name());
+            } else {
+                let scene = self.scene.lock().await;
+                let room = scene.get_room_by_actor(actor).unwrap();
+                println!("{}: {}", actor.name(), result.talk);
+                room.broadcast
+                    .send(Message::user(format!("{}: {}", actor.name(), result.talk)))
+                    .unwrap();
             }
-
-            macro_rules! broadcast {
-                ($broadcast: expr, $($arg:tt)*) => {
-                    println!($($arg)*);
-                    $broadcast.broadcast.send(Message::user(format!($($arg)*))).unwrap();
-                }
-            }
-
-            match action.action.as_str() {
-                "SILENT" => {
-                    println!("< {} 選擇沉默 >", actor.name());
-                    return Ok(());
-                }
-                "TALK" => {
-                    let room = scene.get_room_by_actor(actor).unwrap();
-                    broadcast!(room, "{}: {}", actor.name(), action.content);
-                    return Ok(())
-                }
-                "GOTO" => {
-                    let from_room = scene.get_room_by_actor(actor).unwrap();
-                    let from = from_room.name.clone();
-                    let Some(to) = scene.match_room(&action.content).cloned() else {
-                        let all_room = scene
-                            .rooms
-                            .keys()
-                            .filter(|&r| r != &action.content)
-                            .cloned()
-                            .collect::<Vec<String>>()
-                            .join("\n");
-                        handle_invalid_action!(
-                            "你嘗試前往 {}, 但是這個區域不存在，請重新選擇一個區域。\n{}",
-                            action.content,
-                            all_room
-                        );
-                        continue;
-                    };
-
-                    if from == to {
-                        let all_room = scene
-                            .rooms
-                            .keys()
-                            .filter(|&r| r != &to)
-                            .cloned()
-                            .collect::<Vec<String>>()
-                            .join("\n");
-                        handle_invalid_action!(
-                            "你嘗試前往 {}, 但是你已經在這個區域了，請重新選擇一個區域。\n{}",
-                            action.content,
-                            all_room
-                        );
-                        continue;
-                    }
-
-                    broadcast!(from_room, "< {} 離開 {}，前往 {} >", actor.name(), from, to);
-                    scene.swap_actor_room(actor, &from, &to).await?;
-                    actor
-                        .agent()
-                        .lock()
-                        .await
-                        .history
-                        .push(Message::user(format!("< 你前往{} >", to)));
-                    return Ok(());
-                }
-                "OBSERVE" => {
-                    let room = scene.get_room_by_actor(actor).unwrap();
-                    println!("< {} 仔細觀察周圍的環境 >", actor.name());
-                    actor
-                        .agent()
-                        .lock()
-                        .await
-                        .history
-                        .push(Message::user(format!(
-                            "< 你仔細觀察 {} 周圍的環境 >\n你發現了以下物品:\n{}",
-                            room.name,
-                            room.items
-                                .iter()
-                                .map(|item| format!("{}: {}", item.name, item.description))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        )));
-
-                    return Ok(());
-                }
-                "PICKUP" => {
-                    let room = scene.get_room_by_actor_mut(actor).unwrap();
-                    let Some(item) = room
-                        .items
-                        .iter()
-                        .position(|item| item.name == action.content)
-                    else {
-                        handle_invalid_action!(
-                            "你嘗試撿起 {}, 但是這個物品不存在，請重新選擇一個物品，或是使用 OBSERVE 來確認一下周圍的物品。",
-                            action.content
-                        );
-                        continue;
-                    };
-                    let item = room.items.swap_remove(item);
-
-                    broadcast!(room, "< {} 撿起了 {} >", actor.name(), item.name);
-                    actor.inventory().insert(item);
-                    return Ok(());
-                }
-                "DROP" => {
-                    let item_opt = actor
-                        .inventory()
-                        .iter()
-                        .find(|item| item.name == action.content)
-                        .map(|ref_val| ref_val.clone());
-
-                    let Some(item) = item_opt else {
-                        handle_invalid_action!(
-                            "你嘗試丟棄 {}, 但是你的背包裡沒有這個物品，請重新確認你身上的物品。",
-                            action.content
-                        );
-                        continue;
-                    };
-
-                    actor.inventory().remove(&item);
-
-                    let room = scene.get_room_by_actor_mut(actor).unwrap();
-                    broadcast!(room, "< {} 將 {} 丟棄在原地 >", actor.name(), item.name);
-                    room.items.push(item);
-
-                    return Ok(())
-                }
-                "USE" => {
-                    let item_opt = actor
-                        .inventory()
-                        .iter()
-                        .find(|item| item.name == action.content)
-                        .map(|ref_val| ref_val.clone());
-
-                    let Some(item) = item_opt else {
-                        handle_invalid_action!(
-                            "你嘗試使用 {}, 但是你的背包裡沒有這個物品，請重新確認你身上的物品。",
-                            action.content
-                        );
-                        continue;
-                    };
-
-                    if !item.tags.contains(&ItemTag::Food) && !item.tags.contains(&ItemTag::Drink) {
-                        handle_invalid_action!(
-                            "你嘗試使用 {}, 但它不是食物或飲料，無法用來消耗與恢復狀態。",
-                            action.content
-                        );
-                        continue;
-                    }
-
-                    actor.inventory().remove(&item);
-
-                    let room = scene.get_room_by_actor(actor).unwrap();
-                    broadcast!(
-                        room,
-                        "< {} 使用了 {}，恢復了自身的狀態 >",
-                        actor.name(),
-                        item.name
-                    );
-
-                    let attrs = actor.attrs();
-                    for t in item.tags {
-                        match t {
-                            ItemTag::Food => *attrs.get_mut(&ActorAttr::Hunger).unwrap() += 128,
-                            ItemTag::Drink => *attrs.get_mut(&ActorAttr::Thirst).unwrap() += 128,
-                            ItemTag::Weapon => {}
-                        }
-                    }
-
-                    return Ok(());
-                }
-                "ATTACK" => {
-                    let room = scene.get_room_by_actor_mut(actor).unwrap();
-                    for target in room.actors.iter() {
-                        if !action.content.contains(target.name()) {
-                            continue;
-                        }
-
-                        if actor == target {
-                            handle_invalid_action!(
-                                "你嘗試攻擊 {}, 但是你不能攻擊自己，請重新選擇一個行動。",
-                                action.content
-                            );
-                            continue;
-                        }
-
-                        if target.status().contains(&ActorStatus::Dead) {
-                            handle_invalid_action!(
-                                "你嘗試攻擊 {}, 但是他已經死了，請重新選擇一個行動。",
-                                action.content
-                            );
-                            continue;
-                        }
-
-                        let weapon = actor
-                            .inventory()
-                            .iter()
-                            .find(|i| i.tags.contains(&ItemTag::Weapon));
-
-                        broadcast!(
-                            room,
-                            "< {} 使用 {} 殺死了 {} >",
-                            actor.name(),
-                            match &weapon {
-                                Some(v) => v.name.to_string(),
-                                None => "空手".to_string(),
-                            },
-                            target.name()
-                        );
-
-                        let status = target.status();
-                        status.insert(ActorStatus::Dead);
-
-                        // Drop all items to room
-                        let inventory = target.inventory();
-                        let items: Vec<_> =
-                            inventory.iter().map(|ref_val| ref_val.clone()).collect();
-                        inventory.clear();
-
-                        for item in items {
-                            broadcast!(room, "< {} 掉落了 {} >", target.name(), item.name);
-                            room.items.push(item);
-                        }
-
-                        return Ok(());
-                    }
-
-                    handle_invalid_action!(
-                        "你嘗試攻擊不在此區域的人 {}, 可能在其他區域。",
-                        action.content
-                    );
-                }
-                name => {
-                    handle_invalid_action!("行為 {} 不存在，請使用列表中的行為", name);
-                }
-            };
+            break;
         }
-        bail!("failed to action: {:?}", actor);
+
+        Ok(())
     }
 
     async fn display_scene(&self) -> String {

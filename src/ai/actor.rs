@@ -282,6 +282,14 @@ pub struct ActorAction {
     pub action: String,
     pub content: String,
     pub thought: String,
+    #[serde(default)]
+    pub talk: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActorTalk {
+    pub thought: String,
+    pub talk: String,
 }
 
 impl ActorAgent {
@@ -295,17 +303,53 @@ impl ActorAgent {
         self.context.bind(&mut self.agent);
         Ok(())
     }
+    pub async fn talk(&mut self, prompt: &str) -> Result<ActorTalk> {
+        let prompt = Message::user(format!(
+            "請你嚴格遵守以下輸出格式規則，**絕對不要**輸出任何額外的解釋、問候語或在 JSON 範圍外的思考過程。必須確保輸出為純粹且合法的 JSON 格式。
+
+### [輸出規則]
+嚴格按照以下 JSON 結構輸出，每次只能輸出單一個 JSON 物件。該物件必須包含 `thought` 和 `talk` 兩個鍵值。任何不符合此 JSON 格式的輸出都將被視為無效。
+
+### [JSON 欄位定義]
+* **`thought`**：字串。描述你的思考過程和理由。
+* **`talk`**：字串。你想說的話；只能包含單句話，不得換行；若選擇沉默則填入空字串 `\"\"`。
+
+{}",
+            prompt
+        ));
+
+        for _ in 1..=3 {
+            let response = match self.agent.chat(prompt.clone(), self.history.clone()).await {
+                Ok(res) => res,
+                Err(e) => {
+                    error!("Failed to get response: {}", e);
+                    continue;
+                }
+            };
+
+            match serde_json::from_str(&response) {
+                Ok(r) => {
+                    self.history.push(Message::assistant(response.clone()));
+                    return Ok(r);
+                }
+                Err(_) => warn!("Failed to parse response: {}", response),
+            }
+        }
+        bail!("Failed to get valid talk after 3 attempts");
+    }
+
     pub async fn action(&mut self, prompt: &str) -> Result<ActorAction> {
         let prompt = Message::user(format!(
             "請你嚴格遵守以下輸出格式規則，**絕對不要**輸出任何額外的解釋、問候語或在 JSON 範圍外的思考過程。必須確保輸出為純粹且合法的 JSON 格式。
 
 ### [輸出規則]
-嚴格按照以下 JSON 結構輸出，每次只能輸出單一個 JSON 物件，代表一個動作。該物件必須包含 `thought`、`action` 和 `content` 三個鍵值。任何不符合此 JSON 格式的輸出都將被視為無效。
+嚴格按照以下 JSON 結構輸出，每次只能輸出單一個 JSON 物件，代表一個動作。該物件必須包含 `thought`、`action`、`content` 和 `talk` 四個鍵值。任何不符合此 JSON 格式的輸出都將被視為無效。
 
 ### [JSON 欄位定義]
 * **`thought`**：字串。描述你在做出該行為前的思考過程和理由，請確保這部分內容簡潔明了，直接反映你的內心想法和判斷。
 * **`action`**：字串。行為名稱，必須完全匹配。
 * **`content`**：字串。根據行為名稱的不同而有所區別，若無對應內容則填入空字串 `\"\"`。
+* **`talk`**：字串。在執行行動的同時，你想對周圍的人說的話；只能包含單句話，不得換行；若選擇沉默則填入空字串 `\"\"`。
 
 {}",
             prompt
