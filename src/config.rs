@@ -4,9 +4,10 @@ use anyhow::Result;
 use rig::{
     agent,
     client::{CompletionClient, Nothing},
-    providers::ollama::{self, CompletionModel},
+    providers::ollama::{Client, CompletionModel},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tracing::{info, warn};
 
 pub type TAgent = agent::Agent<CompletionModel>;
@@ -59,11 +60,13 @@ impl Config {
     }
 
     pub fn agent(&self) -> Result<TAgent> {
-        let client = ollama::Client::builder()
+        let client = Client::builder()
             .base_url(self.ollama_url.clone())
             .api_key(Nothing)
             .build()?;
-        Ok(client.agent(&self.model).build())
+        Ok(client.agent(&self.model).additional_params(json!({
+            "think": false,
+        })).build())
     }
 }
 
